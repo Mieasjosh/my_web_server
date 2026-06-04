@@ -26,6 +26,7 @@
 #include "../CGImysql/sql_connection_pool.h"
 #include "../timer/lst_timer.h"
 #include "../log/log.h"
+#include "../upload/upload_handler.h"  // 上传功能：UploadManager 单例、UploadMeta 元数据
 
 class http_conn
 {
@@ -58,7 +59,15 @@ public:
         FORBIDDEN_REQUEST,//FORBIDDEN_REQUEST
         FILE_REQUEST,//请求资源可以正常访问
         INTERNAL_ERROR,//服务器内部错误，该结果在主状态机逻辑switch的default下，一般不会触发
-        CLOSED_CONNECTION
+        CLOSED_CONNECTION,
+
+        // ---------- 上传功能新增 ----------
+        // UPLOAD_STREAMING：/upload/chunk 请求，headers 解析完毕，body 是二进制分块，
+        //                   不能缓存在 m_read_buf（太大），需要直接流式写入磁盘
+        UPLOAD_STREAMING,
+        // UPLOAD_RESPONSE：/upload/init 或 /upload/complete 已处理完毕，
+        //                  JSON 响应体已写入 m_upload_response_body，等待发送
+        UPLOAD_RESPONSE
     };
 
     //从状态机的状态
@@ -108,6 +117,22 @@ private:
     HTTP_CODE parse_content(char *text);
     //生成响应报文
     HTTP_CODE do_request();
+
+    // ---------- 上传功能新增方法 ----------
+
+    // 流式接收 /upload/chunk 的二进制 body：直接从 socket recv → pwrite 写磁盘
+    // 不经过 m_read_buf（因为分块可能 > 2KB），读取完毕后构造 JSON 响应到 m_upload_response_body
+    bool receive_file_chunk();
+
+    // 简易 JSON 解析：从 JSON 字符串中提取指定 key 的字符串值
+    // 例：{"filename":"test.mp4"} → json_get_string(json, "filename") → "test.mp4"
+    // 会在源字符串中直接写 '\0' 截断，返回指向源字符串内部的指针；找不到返回 NULL
+    static char *json_get_string(char *json, const char *key);
+
+    // 简易 JSON 解析：从 JSON 字符串中提取指定 key 的数值
+    // 例：{"totalSize":1024} → json_get_long(json, "totalSize") → 1024
+    // 找不到返回 -1
+    static long json_get_long(char *json, const char *key);
 
     //m_start_line是已经解析的字符个数
     //get_line用于将指针向后偏移，指向未处理的字符   总是忘记这两个变量代表的含义！！！
@@ -184,6 +209,28 @@ private:
     char sql_user[100];
     char sql_passwd[100];
     char sql_name[100];
+
+    // ===================== 上传功能新增成员 =====================
+
+    // m_upload_streaming：标记当前请求是否需要流式接收 body
+    //   true → /upload/chunk 请求，body 不从 m_read_buf 读，直接 recv → pwrite 到磁盘
+    bool m_upload_streaming;
+
+    // m_upload_content_len：/upload/chunk 请求的 Content-Length 值
+    //   等于当前分块的大小（字节），流式接收循环的总字节数
+    long m_upload_content_len;
+
+    // m_upload_chunk_offset：/upload/chunk 请求中 X-Offset 头部的值
+    //   表示这个分块在文件中的起始偏移量，传给 pwrite 定位写
+    long m_upload_chunk_offset;
+
+    // m_upload_filename[256]：从 X-Filename 头部提取的文件名
+    //   客户端在每个上传请求中都带这个头部，服务器用它查找对应的 UploadMeta
+    char m_upload_filename[256];
+
+    // m_upload_response_body[1024]：上传 API 的 JSON 响应体
+    //   如 {"status":"ok","received":1048576}，复用 WRITE_BUFFER_SIZE 的大小
+    char m_upload_response_body[1024];
 
 };
 

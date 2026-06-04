@@ -21,9 +21,9 @@
 
 #include <string>
 #include <map>
-#include <pthread.h>
 #include <stddef.h>    // size_t
 #include <unistd.h>    // ssize_t（有符号的 size_t，用于表示 write/read 返回值）
+#include "../lock/locker.h"
 
 // ---------------------------------------------------------------------------
 // UploadMeta —— 单个上传任务的元数据
@@ -173,10 +173,10 @@ public:
     void cleanup_stale(time_t max_age_seconds);
 
 private:
-    // 构造函数私有（单例模式），初始化互斥锁
-    UploadManager() { pthread_mutex_init(&m_mutex, NULL); }
+    // 构造函数私有（单例模式）；locker 成员自动初始化互斥锁
+    UploadManager() {}
 
-    // 析构函数：销毁互斥锁前先遍历 map 关闭所有打开的 fd
+    // 析构函数：遍历 map 关闭所有打开的 fd；locker 成员自动销毁互斥锁
     ~UploadManager();
 
     // 禁止拷贝
@@ -186,7 +186,7 @@ private:
     // ---- 成员变量 ----
     std::map<std::string, UploadMeta> m_uploads;   // 文件名 → 上传元数据
     std::string m_upload_dir;                       // 上传文件目录路径
-    pthread_mutex_t m_mutex;                        // 互斥锁（保护 m_uploads）
+    locker m_mutex;                                 // 互斥锁（保护 m_uploads）
 };
 
 #endif

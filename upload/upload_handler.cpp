@@ -92,7 +92,7 @@ UploadManager::~UploadManager()
         }
     }
     m_uploads.clear();
-    pthread_mutex_destroy(&m_mutex);
+    // 互斥锁由 locker 析构函数自动销毁，无需手动 pthread_mutex_destroy
 }
 
 // ===========================================================================
@@ -102,14 +102,14 @@ bool UploadManager::init_upload(const std::string &filename, size_t total_size,
                                 const std::string &md5, std::string &out_error)
 {
     // ---- 1. 加锁 ----
-    pthread_mutex_lock(&m_mutex);
+    m_mutex.lock();
 
     // ---- 2. 确保上传目录存在 ----
     if (!ensure_directory(m_upload_dir.c_str()))
     {
         out_error = "无法创建上传目录：";
         out_error += err_to_str(errno);
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
@@ -129,7 +129,7 @@ bool UploadManager::init_upload(const std::string &filename, size_t total_size,
     if (get_file_size(final_path.c_str()) >= 0)
     {
         out_error = "文件已存在：" + filename;
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
@@ -142,11 +142,11 @@ bool UploadManager::init_upload(const std::string &filename, size_t total_size,
         if (it->second.expected_md5 != md5)
         {
             out_error = "MD5 与之前注册的不一致，可能是不同文件";
-            pthread_mutex_unlock(&m_mutex);
+            m_mutex.unlock();
             return false;
         }
         // 正常续传：out_error 留空表示成功，调用方用 get_upload 查 received_bytes
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return true;
     }
 
@@ -181,14 +181,14 @@ bool UploadManager::init_upload(const std::string &filename, size_t total_size,
     {
         out_error = "无法创建临时文件：";
         out_error += err_to_str(errno);
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
     // ---- 8. 记录到 map 中 ----
     m_uploads[filename] = meta;
 
-    pthread_mutex_unlock(&m_mutex);
+    m_mutex.unlock();
     return true;
 }
 
@@ -198,13 +198,13 @@ bool UploadManager::init_upload(const std::string &filename, size_t total_size,
 ssize_t UploadManager::write_chunk(const std::string &filename, const char *data,
                                     size_t len, size_t offset)
 {
-    pthread_mutex_lock(&m_mutex);
+    m_mutex.lock();
 
     // ---- 1. 查找上传记录 ----
     std::map<std::string, UploadMeta>::iterator it = m_uploads.find(filename);
     if (it == m_uploads.end())
     {
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return -1;   // 找不到此文件的上传记录
     }
 
@@ -219,7 +219,7 @@ ssize_t UploadManager::write_chunk(const std::string &filename, const char *data
         // 实际上：如果 offset 小于 received_bytes，说明是重复分块（幂等，可以忽略）
         //         如果 offset 大于 received_bytes，说明跳过了数据（客户端 bug）
         // 当前策略：直接拒绝乱序，让客户端按顺序发送
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return -1;
     }
 
@@ -231,7 +231,7 @@ ssize_t UploadManager::write_chunk(const std::string &filename, const char *data
     ssize_t written = pwrite(meta.fd, data, len, (off_t)offset);
     if (written < 0)
     {
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return -1;   // 磁盘写入失败（磁盘满 / I/O 错误等）
     }
 
@@ -239,7 +239,7 @@ ssize_t UploadManager::write_chunk(const std::string &filename, const char *data
     // 注意：写成多少就加多少（written 可能小于 len，虽然正常情况不会）
     meta.received_bytes += (size_t)written;
 
-    pthread_mutex_unlock(&m_mutex);
+    m_mutex.unlock();
     return written;
 }
 
@@ -249,14 +249,14 @@ ssize_t UploadManager::write_chunk(const std::string &filename, const char *data
 bool UploadManager::complete_upload(const std::string &filename,
                                      std::string &out_error)
 {
-    pthread_mutex_lock(&m_mutex);
+    m_mutex.lock();
 
     // ---- 1. 查找上传记录 ----
     std::map<std::string, UploadMeta>::iterator it = m_uploads.find(filename);
     if (it == m_uploads.end())
     {
         out_error = "没有此文件的上传记录：" + filename;
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
@@ -270,7 +270,7 @@ bool UploadManager::complete_upload(const std::string &filename,
                  "文件未接收完整：预期 %zu 字节，实际收到 %zu 字节",
                  meta.total_size, meta.received_bytes);
         out_error = buf;
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
@@ -281,7 +281,7 @@ bool UploadManager::complete_upload(const std::string &filename,
     {
         out_error = "fsync 失败：";
         out_error += err_to_str(errno);
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
@@ -297,7 +297,7 @@ bool UploadManager::complete_upload(const std::string &filename,
         out_error = "无法计算文件 MD5（临时文件可能已被删除）";
         // 清理失败的上传记录（但保留临时文件，方便排查问题）
         m_uploads.erase(it);
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
@@ -314,7 +314,7 @@ bool UploadManager::complete_upload(const std::string &filename,
         unlink(meta.temp_path.c_str());
         m_uploads.erase(it);
 
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
@@ -326,14 +326,14 @@ bool UploadManager::complete_upload(const std::string &filename,
         out_error += err_to_str(errno);
         // rename 失败不删临时文件，数据还在，可以手动处理
         m_uploads.erase(it);
-        pthread_mutex_unlock(&m_mutex);
+        m_mutex.unlock();
         return false;
     }
 
     // ---- 7. 成功！从 map 中移除记录 ----
     m_uploads.erase(it);
 
-    pthread_mutex_unlock(&m_mutex);
+    m_mutex.unlock();
     return true;
 }
 
@@ -342,7 +342,7 @@ bool UploadManager::complete_upload(const std::string &filename,
 // ===========================================================================
 const UploadMeta *UploadManager::get_upload(const std::string &filename)
 {
-    pthread_mutex_lock(&m_mutex);
+    m_mutex.lock();
 
     std::map<std::string, UploadMeta>::iterator it = m_uploads.find(filename);
     const UploadMeta *result = NULL;
@@ -351,7 +351,7 @@ const UploadMeta *UploadManager::get_upload(const std::string &filename)
         result = &(it->second);
     }
 
-    pthread_mutex_unlock(&m_mutex);
+    m_mutex.unlock();
     return result;
 }
 
@@ -360,7 +360,7 @@ const UploadMeta *UploadManager::get_upload(const std::string &filename)
 // ===========================================================================
 void UploadManager::remove_upload(const std::string &filename)
 {
-    pthread_mutex_lock(&m_mutex);
+    m_mutex.lock();
 
     std::map<std::string, UploadMeta>::iterator it = m_uploads.find(filename);
     if (it != m_uploads.end())
@@ -372,7 +372,7 @@ void UploadManager::remove_upload(const std::string &filename)
         m_uploads.erase(it);              // 从 map 中删除
     }
 
-    pthread_mutex_unlock(&m_mutex);
+    m_mutex.unlock();
 }
 
 // ===========================================================================
@@ -382,7 +382,7 @@ void UploadManager::remove_upload(const std::string &filename)
 // 场景：客户端上传到一半断网了，再也不回来继续——这些"僵尸"记录需要清理。
 void UploadManager::cleanup_stale(time_t max_age_seconds)
 {
-    pthread_mutex_lock(&m_mutex);
+    m_mutex.lock();
 
     time_t now = time(NULL);
 
@@ -407,5 +407,5 @@ void UploadManager::cleanup_stale(time_t max_age_seconds)
         }
     }
 
-    pthread_mutex_unlock(&m_mutex);
+    m_mutex.unlock();
 }

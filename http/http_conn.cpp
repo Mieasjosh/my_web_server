@@ -158,6 +158,13 @@ void http_conn::init()
     timer_flag = 0;
     improv = 0;
 
+    // ---------- 上传功能：每次新请求时重置上传相关状态 ----------
+    m_upload_streaming = false;
+    m_upload_content_len = 0;
+    m_upload_chunk_offset = 0;
+    memset(m_upload_filename, '\0', sizeof(m_upload_filename));
+    memset(m_upload_response_body, '\0', sizeof(m_upload_response_body));
+
     memset(m_read_buf,'\0',READ_BUFFER_SIZE);
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
     memset(m_real_file, '\0', FILENAME_LEN);
@@ -381,6 +388,21 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
         text+=strspn(text," \t");
         m_host=text;
     }
+    // ---------- 上传功能：解析自定义头部 X-Filename（文件名） ----------
+    else if (strncasecmp(text, "X-Filename:", 11) == 0)
+    {
+        text += 11;                                    // 跳过 "X-Filename:"
+        text += strspn(text, " \t");                  // 跳过冒号后的空格/tab
+        strncpy(m_upload_filename, text,
+                sizeof(m_upload_filename) - 1);        // 安全拷贝，保留末尾 \0
+    }
+    // ---------- 上传功能：解析自定义头部 X-Offset（分块偏移量） ----------
+    else if (strncasecmp(text, "X-Offset:", 9) == 0)
+    {
+        text += 9;                                     // 跳过 "X-Offset:"
+        text += strspn(text, " \t");                  // 跳过冒号后的空格/tab
+        m_upload_chunk_offset = atol(text);            // 字符串转 long
+    }
     else
         LOG_INFO("oop!unknow header: %s", text);
     return NO_REQUEST;
@@ -459,6 +481,63 @@ http_conn::HTTP_CODE http_conn::process_read()
     return NO_REQUEST;
 }
 
+// ===========================================================================
+// json_get_string —— 简易 JSON 字符串值提取
+// ===========================================================================
+// 设计初衷：项目没有引入任何 JSON 库（如 jsoncpp），而上传 API 只需要解析
+// 非常简单的 JSON 如 {"filename":"test.mp4","totalSize":1024,"md5":"abc..."}。
+// 用一个轻量级的 strstr + 字符查找实现，避免引入第三方依赖。
+//
+// 原理：
+//   构造搜索模式 "\"key\":\"" → strstr 查找 → 跳过前缀 → strchr 找结尾引号
+//   在结尾引号处写 '\0' 截断 → 返回指向值的指针
+//
+// 限制：
+//   ① 不支持转义字符（如 \" 或 \n）——但文件名不含这些，够用
+//   ② 不支持嵌套的 JSON 对象或数组
+//   ③ 会修改源字符串（截断），所以传入的 json 必须是可写缓冲区
+char *http_conn::json_get_string(char *json, const char *key)
+{
+    // 构造搜索模式，例如 key="filename" → 搜索 "\"filename\":\""
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\":\"", key);
+
+    char *start = strstr(json, search);
+    if (start == NULL)
+        return NULL;               // 没找到这个 key
+
+    start += strlen(search);       // start 现在指向 value 的第一个字符
+
+    // 找到 value 结束的引号
+    char *end = strchr(start, '"');
+    if (end == NULL)
+        return NULL;               // JSON 格式错误：没有闭合引号
+    *end = '\0';                   // 截断，让 start 成为一个 C 字符串
+
+    return start;
+}
+
+// ===========================================================================
+// json_get_long —— 简易 JSON 数值提取
+// ===========================================================================
+// 类似 json_get_string，但 key 后面跟的是数字而非引号字符串。
+// 搜索模式 "\"key\":" → atol 转整数
+long http_conn::json_get_long(char *json, const char *key)
+{
+    char search[128];
+    snprintf(search, sizeof(search), "\"%s\":", key);
+
+    char *start = strstr(json, search);
+    if (start == NULL)
+        return -1;                 // 没找到这个 key
+
+    start += strlen(search);       // start 指向数字的起始位置
+    return atol(start);            // atol 在遇到非数字字符时自动停止
+}
+
+// ===========================================================================
+// do_request —— URL 路由 + 静态文件服务（现有逻辑 + 上传路由）
+// ===========================================================================
 http_conn::HTTP_CODE http_conn::do_request()//这个函数由于涉及登陆注册，还没看懂，到时候要回头！！！！！！
 {
     //将初始化的m_real_file赋值为网站根目录
@@ -467,6 +546,140 @@ http_conn::HTTP_CODE http_conn::do_request()//这个函数由于涉及登陆注�
 
     //找到m_url中/的位置
     const char *p=strrchr(m_url,'/');
+
+    // =====================================================================
+    // 上传功能路由：拦截所有以 /upload/ 开头的 POST 请求
+    // =====================================================================
+    // 必须在 登录/注册路由 之前处理，否则 /upload/ 会被误判为静态文件请求。
+    // 三个子端点：
+    //   /upload/init     → 初始化上传，返回已收字节数（断点续传入口）
+    //   /upload/chunk    → 接收一个二进制分块，流式写入磁盘
+    //   /upload/complete → 完成上传，MD5 校验并 rename
+    if (strncmp(m_url, "/upload/", 8) == 0)
+    {
+        const char *action = m_url + 8;   // action 指向 "init" / "chunk" / "complete"
+
+        // ---- /upload/chunk —— 二进制分块上传 ----
+        if (strcmp(action, "chunk") == 0)
+        {
+            // 必须提供文件名和长度头部，否则无法处理
+            if (m_upload_filename[0] == '\0' || m_content_length <= 0)
+                return BAD_REQUEST;
+
+            // 标记为"流式接收"模式：body 是二进制数据，不经过 m_read_buf 解析，
+            // 而是由 receive_file_chunk() 直接从 socket recv → pwrite 写磁盘
+            m_upload_streaming = true;
+            m_upload_content_len = m_content_length;
+            return UPLOAD_STREAMING;   // process() 收到后会调用 receive_file_chunk()
+        }
+
+        // ---- /upload/init 和 /upload/complete —— JSON 请求 ----
+        // 这两个端点都有 JSON body，已经由 parse_content() 存入 m_string
+        if (m_string == NULL || m_string[0] == '\0')
+            return BAD_REQUEST;    // 缺少 body
+
+        // ---- /upload/init —— 初始化上传 ----
+        if (strcmp(action, "init") == 0)
+        {
+            char *filename   = json_get_string(m_string, "filename");
+            long  total_size = json_get_long(m_string, "totalSize");
+            char *md5        = json_get_string(m_string, "md5");
+
+            if (filename == NULL || total_size <= 0 || md5 == NULL)
+            {
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"error\",\"msg\":\"缺少必填字段: filename/totalSize/md5\"}");
+                return UPLOAD_RESPONSE;
+            }
+
+            // ---- 安全检查：防止目录穿越攻击 ----
+            // 客户端可能传 "../../etc/passwd" 试图写到网站目录之外。
+            // strrchr 找到最后一个 '/' 或 '\'，只取文件名部分（basename）
+            char safe_name[256];
+            {
+                const char *base = strrchr(filename, '/');
+                base = (base != NULL) ? base + 1 : filename;   // 跳过 '/'
+                const char *bs = strrchr(base, '\\');          // Windows 路径也要防
+                base = (bs != NULL) ? bs + 1 : base;
+                strncpy(safe_name, base, sizeof(safe_name) - 1);
+                safe_name[sizeof(safe_name) - 1] = '\0';
+            }
+
+            if (safe_name[0] == '\0')
+            {
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"error\",\"msg\":\"文件名无效\"}");
+                return UPLOAD_RESPONSE;
+            }
+
+            std::string error;
+            UploadManager *mgr = UploadManager::get_instance();
+            if (mgr->init_upload(safe_name, (size_t)total_size, md5, error))
+            {
+                // 成功：返回已接收字节数（新上传为 0，续传为已有大小）
+                const UploadMeta *meta = mgr->get_upload(safe_name);
+                size_t received = (meta != NULL) ? meta->received_bytes : 0;
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"ok\",\"received\":%zu}", received);
+            }
+            else
+            {
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"error\",\"msg\":\"%s\"}", error.c_str());
+            }
+            return UPLOAD_RESPONSE;
+        }
+
+        // ---- /upload/complete —— 完成上传 ----
+        if (strcmp(action, "complete") == 0)
+        {
+            char *filename = json_get_string(m_string, "filename");
+
+            if (filename == NULL)
+            {
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"error\",\"msg\":\"缺少 filename 字段\"}");
+                return UPLOAD_RESPONSE;
+            }
+
+            // 同样的安全过滤
+            char safe_name[256];
+            {
+                const char *base = strrchr(filename, '/');
+                base = (base != NULL) ? base + 1 : filename;
+                const char *bs = strrchr(base, '\\');
+                base = (bs != NULL) ? bs + 1 : base;
+                strncpy(safe_name, base, sizeof(safe_name) - 1);
+                safe_name[sizeof(safe_name) - 1] = '\0';
+            }
+
+            std::string error;
+            UploadManager *mgr = UploadManager::get_instance();
+            if (mgr->complete_upload(safe_name, error))
+            {
+                // 校验成功：返回最终文件的 MD5
+                char final_path[512];
+                snprintf(final_path, sizeof(final_path), "%s/%s",
+                         mgr->get_upload(safe_name) ? "uploads" : "", safe_name);
+                // 注意：complete_upload 成功后记录已从 map 中删除，这里用一个
+                // 固定路径重新计算 MD5（或者让 complete_upload 返回 MD5）
+                // 简化处理：返回成功的 status
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"ok\",\"msg\":\"上传完成，MD5 校验通过\"}");
+            }
+            else
+            {
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"error\",\"msg\":\"%s\"}", error.c_str());
+            }
+            return UPLOAD_RESPONSE;
+        }
+
+        // 未知的 /upload/ 子路径 → 400
+        snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                 "{\"status\":\"error\",\"msg\":\"未知的上传操作: %s\"}", action);
+        return UPLOAD_RESPONSE;
+    }
 
     //处理cgi，实现登录和注册校验
     if(cgi==1 && (*(p+1)=='2' || *(p+1)=='3'))
@@ -612,6 +825,127 @@ mmap 方式（3 次拷贝，少 1 次核心拷贝）：
 如果用read()读取 100MB 的 HTML 文件，read()会试图把整个文件读到用户缓冲区，直接占用 100MB 用户内存；而 mmap 是「按需映射」：
 只有当你访问虚拟内存中某一页（比如 4KB）的地址时，内核才会把磁盘上对应的 4KB 数据加载到内存（缺页中断）；
     */
+}
+
+// ===========================================================================
+// receive_file_chunk —— 流式接收上传分块的二进制 body
+// ===========================================================================
+// 这是整个上传功能最核心的方法。它不经过 m_read_buf（2048 字节太小），
+// 而是直接从 socket recv 读取数据，然后 pwrite 写入磁盘临时文件。
+//
+// 调用前提：parse_headers() 已解析了 X-Filename、X-Offset、Content-Length。
+//           do_request() 确定路由为 /upload/chunk，返回 UPLOAD_STREAMING。
+//           process() 检测到 UPLOAD_STREAMING 后调用本方法。
+//
+// 流程：
+//   ① 处理 m_read_buf 中 header 后面已经读进来的 body 数据（如果有的话）
+//   ② 循环 recv 直到收够 Content-Length 字节，每次 8KB 栈缓冲区
+//   ③ 设置 30 秒 SO_RCVTIMEO，防止卡死的客户端永久占用工作线程
+//   ④ 全部收完后构造 JSON 响应到 m_upload_response_body
+//
+// 返回值：true=成功（JSON 响应已就绪），false=失败（连接中断、磁盘错误等）
+bool http_conn::receive_file_chunk()
+{
+    UploadManager *mgr = UploadManager::get_instance();
+
+    // 剩余需要接收的字节数（不断减少直到 0）
+    long remaining = m_upload_content_len;
+
+    // 当前分块在文件中的写入偏移量
+    long offset = m_upload_chunk_offset;
+
+    // ============================================================
+    // 步骤 1：处理 m_read_buf 中已经"偷跑"进来的 body 字节
+    // ============================================================
+    // HTTP 数据是流式的——socket recv 可能把 headers 后面的部分 body 也一起
+    // 读进来了。m_checked_idx 指向 headers 结束后的位置（\r\n\r\n 之后），
+    // m_read_idx 是已读入缓冲区的末尾。两者之差就是"偷跑"的 body 字节。
+    long body_in_buf = m_read_idx - m_checked_idx;
+    if (body_in_buf > 0)
+    {
+        // 不能超过剩余要收的字节数（防止重复发送的 chunk 导致溢出）
+        long to_write = (body_in_buf > remaining) ? remaining : body_in_buf;
+
+        ssize_t written = mgr->write_chunk(
+            m_upload_filename,
+            m_read_buf + m_checked_idx,   // 数据起始位置
+            (size_t)to_write,
+            (size_t)offset);
+
+        if (written < 0)
+        {
+            snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                     "{\"status\":\"error\",\"msg\":\"写入临时文件失败\"}");
+            return false;
+        }
+
+        remaining -= written;
+        offset    += written;
+    }
+
+    // ============================================================
+    // 步骤 2：循环 recv 直到收够所有分块数据
+    // ============================================================
+    if (remaining > 0)
+    {
+        // ---- 设置 30 秒接收超时 ----
+        // 非阻塞 socket + SO_RCVTIMEO：recv 在内核没有数据时最多等 30 秒，
+        // 超时后返回 -1，errno = EAGAIN。这比纯粹的忙等循环优雅，也避免了
+        // 一个卡死的客户端永远占用工作线程。
+        struct timeval tv = {30, 0};
+        setsockopt(m_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // 栈上 8KB 缓冲区：足够大以减少系统调用次数，又足够小不浪费栈空间
+        char buf[8192];
+
+        while (remaining > 0)
+        {
+            // 每次最多收 8KB，或是剩余字节数（如果剩余不足 8KB）
+            size_t to_read = (remaining > (long)sizeof(buf))
+                             ? sizeof(buf) : (size_t)remaining;
+
+            ssize_t n = recv(m_sockfd, buf, to_read, 0);
+
+            if (n <= 0)
+            {
+                // n == 0：客户端主动关闭连接（发送方断开）
+                // n < 0：出错或超时（errno == EAGAIN/EWOULDBLOCK 表示超时）
+                struct timeval tv_zero = {0, 0};
+                setsockopt(m_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_zero, sizeof(tv_zero));
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"error\",\"msg\":\"接收数据失败或超时\"}");
+                return false;
+            }
+
+            // 把收到的数据写入临时文件
+            ssize_t written = mgr->write_chunk(
+                m_upload_filename, buf, (size_t)n, (size_t)offset);
+
+            if (written < 0)
+            {
+                struct timeval tv_zero = {0, 0};
+                setsockopt(m_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_zero, sizeof(tv_zero));
+                snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+                         "{\"status\":\"error\",\"msg\":\"写入临时文件失败\"}");
+                return false;
+            }
+
+            remaining -= written;
+            offset    += written;
+        }
+
+        // ---- 恢复无超时模式（后续发送响应不需要超时） ----
+        struct timeval tv_zero = {0, 0};
+        setsockopt(m_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv_zero, sizeof(tv_zero));
+    }
+
+    // ============================================================
+    // 步骤 3：构造成功响应
+    // ============================================================
+    // offset 就是当前文件已接收的总字节数（初始偏移 + 本次分块大小）
+    snprintf(m_upload_response_body, sizeof(m_upload_response_body),
+             "{\"status\":\"ok\",\"received\":%ld}", offset);
+    return true;
 }
 
 void http_conn::unmap()
@@ -861,6 +1195,22 @@ bool http_conn::process_write(HTTP_CODE ret)
             }
             break;
         }
+        // ---------- 上传功能：JSON 响应 ----------
+        // /upload/init 和 /upload/complete 成功后返回此状态。
+        // JSON 响应体已经在 m_upload_response_body 中构造好了，
+        // 这里只需把它包装成 HTTP 响应（状态行 + 必要的头部 + JSON body）。
+        case UPLOAD_RESPONSE:
+        {
+            add_status_line(200, ok_200_title);
+            // 手动构造 Content-Type: application/json（而非默认的 text/html）
+            add_response("Content-Type: application/json\r\n");
+            add_content_length(strlen(m_upload_response_body));
+            add_linger();
+            add_blank_line();
+            if (!add_content(m_upload_response_body))
+                return false;
+            break;
+        }
         default:
             return false;
     }
@@ -881,6 +1231,18 @@ void http_conn::process()
     {
         modfd(m_epollfd,m_sockfd,EPOLLIN,m_TRIGMode);
         return;
+    }
+
+    // ---------- 上传功能：流式接收 /upload/chunk 的二进制 body ----------
+    // process_read() 返回 UPLOAD_STREAMING 表示 headers 已解析完毕，
+    // 这是一个 /upload/chunk 请求，body 是二进制分块数据，不能放在 m_read_buf。
+    // 调用 receive_file_chunk() 直接从 socket 读到磁盘，绕过读缓冲区。
+    if (read_ret == UPLOAD_STREAMING)
+    {
+        if (receive_file_chunk())
+            read_ret = UPLOAD_RESPONSE;    // 接收成功 → 返回 JSON 确认
+        else
+            read_ret = INTERNAL_ERROR;     // 接收失败 → 用 m_upload_response_body 返回错误
     }
 
     //调用process_write完成报文响应
