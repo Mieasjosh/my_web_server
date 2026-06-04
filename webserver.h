@@ -46,6 +46,7 @@ public:
     //基础
     int m_port;//服务器监听的端口号
     char *m_root;//服务器静态资源根目录路径,存放 html/css/js 等静态文件。
+    char *m_upload_dir;//上���文件存放目录（例如 "./uploads"），启动时初始化
     int m_log_write;//日志写入模式：0 = 同步写日志，1 = 异步写日志
     int m_close_log;//日志开关：0 = 开启日志，1 = 关闭日志。
     int m_actormodel;//事件处理模型：0=Proactor 模型，1=Reactor 模型

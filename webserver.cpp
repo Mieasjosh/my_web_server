@@ -1,4 +1,5 @@
 #include "webserver.h"
+#include <sys/stat.h>   // mkdir（创建上传目录）
 
 WebServer::WebServer()
 {
@@ -15,6 +16,9 @@ WebServer::WebServer()
 
     //定时器
     users_timer=new client_data[MAX_FD];
+
+    //上传目录（默认置空，init() 中根据配置赋值）
+    m_upload_dir=NULL;
 }
 
 WebServer::~WebServer()
@@ -26,6 +30,8 @@ WebServer::~WebServer()
     delete [] users;
     delete [] users_timer;
     delete m_pool;
+    if (m_upload_dir)
+        free(m_upload_dir);
 }
 
 void WebServer::init(int port, string user, string password, string databasename, int log_write, int opt_linger, int trigmode, int sql_num, int thread_num, int close_log, int actor_model)
@@ -106,6 +112,22 @@ void WebServer::sql_pool()
 
     //初始化数据库读取表
     users->initmysql_result(m_connPool);
+
+    // ========== 上传功能：初始化上传目录 ==========
+    // 上传目录位于当前工作目录下的 ./uploads，与 ./root 平级。
+    // 不在 root 下是为了隔离开：静态文件是手动部署的，上传文件是运行时动态生成的。
+    char server_path[200];
+    getcwd(server_path, 200);
+    const char *upload_subdir = "/uploads";
+    m_upload_dir = (char *)malloc(strlen(server_path) + strlen(upload_subdir) + 1);
+    strcpy(m_upload_dir, server_path);
+    strcat(m_upload_dir, upload_subdir);
+
+    // 告知 UploadManager 上传目录路径（后续 init_upload 会往里写 .tmp 文件）
+    UploadManager::get_instance()->set_upload_dir(m_upload_dir);
+
+    // 如果目录不存在则创建（0755 = owner 可读写执行，group/other 可读执行）
+    mkdir(m_upload_dir, 0755);
 }
 
 void WebServer::thread_pool()
@@ -515,6 +537,11 @@ EPOLLONESHOT：只监听一次事件，当监听完这次事件之后，如果�
         if(timeout)
         {
             utils.timer_handler();
+
+            // ---------- 上传功能：清理超过 1 小时未完成的上传 ----------
+            // 场景：客户端传了一半断网了，临时文件和 map 记录需要定期回收。
+            // 每个 timer tick（默认 5 秒）触发一次，max_age=3600 秒（1 小时）。
+            UploadManager::get_instance()->cleanup_stale(3600);
 
             LOG_INFO("%s", "timer tick");
 
