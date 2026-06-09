@@ -333,22 +333,27 @@ void MD5_Final(unsigned char digest[16], MD5_CTX *ctx)
            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
     };
 
-    // ---- 4. 写入填充数据 ----
+    // ---- 4. 保存原始消息比特长度（必须写在 MD5_Update(padding) 之前！）----
+    // MD5_Update 会修改 ctx->count（把 padding 的比特数也加进去），
+    // 但 RFC 1321 要求最后 8 字节记录的是"原始消息"的长度，不包含 padding。
+    uint32_t orig_count0 = ctx->count[0];   // 原始消息长度（低 32 位）
+    uint32_t orig_count1 = ctx->count[1];   // 原始消息长度（高 32 位）
+
+    // ---- 5. 写入填充数据 ----
     MD5_Update(ctx, PADDING, pad_len);
 
-    // ---- 5. 写入 64 位的原始消息比特长度（little-endian） ----
-    // 用 8 字节表示：前 4 字节 = count[0]（低 32 位），后 4 字节 = count[1]（高 32 位）
+    // ---- 6. 写入 64 位的原始消息比特长度（little-endian） ----
+    // 用 8 字节表示：前 4 字节 = 原始低 32 位，后 4 字节 = 原始高 32 位
     unsigned char bits[8];
     {
-        // 手动编码为 little-endian（不依赖 CPU 字节序）
-        bits[0] = (unsigned char)( ctx->count[0]        & 0xFF);
-        bits[1] = (unsigned char)((ctx->count[0] >>  8) & 0xFF);
-        bits[2] = (unsigned char)((ctx->count[0] >> 16) & 0xFF);
-        bits[3] = (unsigned char)((ctx->count[0] >> 24) & 0xFF);
-        bits[4] = (unsigned char)( ctx->count[1]        & 0xFF);
-        bits[5] = (unsigned char)((ctx->count[1] >>  8) & 0xFF);
-        bits[6] = (unsigned char)((ctx->count[1] >> 16) & 0xFF);
-        bits[7] = (unsigned char)((ctx->count[1] >> 24) & 0xFF);
+        bits[0] = (unsigned char)( orig_count0        & 0xFF);
+        bits[1] = (unsigned char)((orig_count0 >>  8) & 0xFF);
+        bits[2] = (unsigned char)((orig_count0 >> 16) & 0xFF);
+        bits[3] = (unsigned char)((orig_count0 >> 24) & 0xFF);
+        bits[4] = (unsigned char)( orig_count1        & 0xFF);
+        bits[5] = (unsigned char)((orig_count1 >>  8) & 0xFF);
+        bits[6] = (unsigned char)((orig_count1 >> 16) & 0xFF);
+        bits[7] = (unsigned char)((orig_count1 >> 24) & 0xFF);
     }
     MD5_Update(ctx, bits, 8);
 

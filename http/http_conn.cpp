@@ -490,14 +490,21 @@ http_conn::HTTP_CODE http_conn::process_read()
 //
 // 原理：
 //   构造搜索模式 "\"key\":\"" → strstr 查找 → 跳过前缀 → strchr 找结尾引号
-//   在结尾引号处写 '\0' 截断 → 返回指向值的指针
+//   → 计算 value 长度 → memcpy 到静态缓冲区 → 返回缓冲区指针
+//
+// 与旧版的区别：旧版直接 *end='\0' 截断原始 JSON，导致后续解析（如 json_get_long）
+//   被提前插入的 \0 挡住搜不到后面的 key。新版用 memcpy 不修改原始数据。
 //
 // 限制：
 //   ① 不支持转义字符（如 \" 或 \n）——但文件名不含这些，够用
 //   ② 不支持嵌套的 JSON 对象或数组
-//   ③ 会修改源字符串（截断），所以传入的 json 必须是可写缓冲区
+//   ③ 结果存放在 static 缓冲区中，下一次调用会覆盖（调用方应在下次调用前用完或拷贝）
 char *http_conn::json_get_string(char *json, const char *key)
 {
+    // static 缓冲区：同一线程连续调用 json_get_string 会覆盖，所以调用方要注意
+    // 不要用指针保存上一次结果的同时再调用本函数。
+    static char buf[256];
+
     // 构造搜索模式，例如 key="filename" → 搜索 "\"filename\":\""
     char search[128];
     snprintf(search, sizeof(search), "\"%s\":\"", key);
@@ -512,9 +519,15 @@ char *http_conn::json_get_string(char *json, const char *key)
     char *end = strchr(start, '"');
     if (end == NULL)
         return NULL;               // JSON 格式错误：没有闭合引号
-    *end = '\0';                   // 截断，让 start 成为一个 C 字符串
 
-    return start;
+    // 计算 value 长度，拷贝到静态缓冲区（不修改原始 JSON）
+    size_t len = end - start;
+    if (len > sizeof(buf) - 1)
+        len = sizeof(buf) - 1;     // 截断过长的值（255 字节以内）
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+
+    return buf;
 }
 
 // ===========================================================================
@@ -581,11 +594,21 @@ http_conn::HTTP_CODE http_conn::do_request()//这个函数由于涉及登陆注�
         // ---- /upload/init —— 初始化上传 ----
         if (strcmp(action, "init") == 0)
         {
-            char *filename   = json_get_string(m_string, "filename");
-            long  total_size = json_get_long(m_string, "totalSize");
-            char *md5        = json_get_string(m_string, "md5");
+            // 注意：json_get_string 使用内部 static 缓冲区，连续调用会相互覆盖。
+            // 所以必须把返回的字符串值立刻拷贝到局部数组，再调用下一次 json_get_xxx。
+            char filename[256] = {0};
+            {
+                char *p = json_get_string(m_string, "filename");
+                if (p) strncpy(filename, p, sizeof(filename) - 1);
+            }
+            long total_size = json_get_long(m_string, "totalSize");
+            char md5[64] = {0};
+            {
+                char *p = json_get_string(m_string, "md5");
+                if (p) strncpy(md5, p, sizeof(md5) - 1);
+            }
 
-            if (filename == NULL || total_size <= 0 || md5 == NULL)
+            if (filename[0] == '\0' || total_size <= 0 || md5[0] == '\0')
             {
                 snprintf(m_upload_response_body, sizeof(m_upload_response_body),
                          "{\"status\":\"error\",\"msg\":\"缺少必填字段: filename/totalSize/md5\"}");

@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>文件上传 - 断点续传</title>
+
+    <!-- spark-md5：在浏览器端计算文件 MD5，用于完整性校验 -->
+    <script src="https://cdn.jsdelivr.net/npm/spark-md5@3.0.2/spark-md5.min.js"></script>
+
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh;
+        }
+        .container {
+            background: #fff; border-radius: 12px; padding: 40px;
+            width: 500px; box-shadow: 0 2px 20px rgba(0,0,0,0.08);
+        }
+        h1 { font-size: 22px; margin-bottom: 8px; }
+        .subtitle { color: #888; font-size: 13px; margin-bottom: 24px; }
+
+        /* 文件拖拽区域 */
+        .drop-zone {
+            border: 2px dashed #ddd; border-radius: 10px;
+            padding: 40px; text-align: center;
+            cursor: pointer; transition: border-color 0.3s;
+            margin-bottom: 16px;
+        }
+        .drop-zone:hover, .drop-zone.dragover { border-color: #4a90d9; }
+        .drop-zone p { color: #aaa; font-size: 14px; }
+        .drop-zone .filename { color: #333; font-weight: 600; word-break: break-all; }
+        .drop-zone .filesize { color: #999; font-size: 12px; }
+
+        /* 按钮 */
+        .btn {
+            width: 100%; padding: 12px; border: none; border-radius: 8px;
+            font-size: 15px; cursor: pointer; transition: background 0.3s;
+        }
+        .btn-upload { background: #4a90d9; color: #fff; }
+        .btn-upload:hover { background: #357abd; }
+        .btn-upload:disabled { background: #ccc; cursor: not-allowed; }
+
+        /* 进度条 */
+        .progress-wrap { margin: 16px 0; display: none; }
+        .progress-bar {
+            width: 100%; height: 8px; border-radius: 4px;
+            background: #eee; overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%; background: #4a90d9;
+            transition: width 0.3s; width: 0%;
+        }
+        .progress-text { color: #666; font-size: 13px; margin-top: 6px; }
+
+        /* 状态提示 */
+        .status { margin-top: 12px; font-size: 13px; min-height: 20px; }
+        .status.ok { color: #27ae60; }
+        .status.err { color: #e74c3c; }
+
+        input[type="file"] { display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>📁 文件上传</h1>
+    <p class="subtitle">支持断点续传 · MD5 完整性校验</p>
+
+    <!-- 文件选择区域（点击选择 / 拖拽） -->
+    <div class="drop-zone" id="dropZone">
+        <p id="dropText">点击选择文件，或拖拽文件到此处</p>
+        <p class="filename" id="fileName"></p>
+        <p class="filesize" id="fileSize"></p>
+    </div>
+    <input type="file" id="fileInput">
+
+    <!-- 上传按钮 -->
+    <button class="btn btn-upload" id="uploadBtn" disabled>开始上传</button>
+
+    <!-- 进度条 -->
+    <div class="progress-wrap" id="progressWrap">
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <p class="progress-text" id="progressText"></p>
+    </div>
+
+    <!-- 状态 -->
+    <p class="status" id="status"></p>
+</div>
+
+<!-- ================================================================ -->
+<!-- JavaScript 上传逻辑                                               -->
+<!-- ================================================================ -->
+<script>
+// ----------------------------- 常量配置 -----------------------------
+// 每个分块 1KB（1024 字节），留出足够空间给 HTTP headers
+// READ_BUFFER_SIZE = 2048，headers 约占 300~500 字节，1KB body 安全
+const CHUNK_SIZE = 1024;
+
+const el = {
+    dropZone:   document.getElementById('dropZone'),
+    dropText:   document.getElementById('dropText'),
+    fileName:   document.getElementById('fileName'),
+    fileSize:   document.getElementById('fileSize'),
+    fileInput:  document.getElementById('fileInput'),
+    uploadBtn:  document.getElementById('uploadBtn'),
+    progressWrap: document.getElementById('progressWrap'),
+    progressFill: document.getElementById('progressFill'),
+    progressText: document.getElementById('progressText'),
+    status:     document.getElementById('status'),
+};
+
+let selectedFile = null;    // 用户选中的文件对象
+let abortFlag   = false;    // 中断标志（暂未使用，预留）
+
+// ----------------------------- 工具函数 -----------------------------
+function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1073741824) return (bytes / 1048576).toFixed(1) + ' MB';
+    return (bytes / 1073741824).toFixed(2) + ' GB';
+}
+
+function setStatus(msg, cls) {
+    el.status.textContent = msg;
+    el.status.className = 'status ' + (cls || '');
+}
+
+// ----------------------------- 文件选择 -----------------------------
+el.dropZone.addEventListener('click', () => el.fileInput.click());
+el.fileInput.addEventListener('change', (e) => {
+    if (e.target.files.length > 0) selectFile(e.target.files[0]);
+});
+
+// 拖拽支持
+el.dropZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    el.dropZone.classList.add('dragover');
+});
+el.dropZone.addEventListener('dragleave', () => {
+    el.dropZone.classList.remove('dragover');
+});
+el.dropZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    el.dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length > 0) selectFile(e.dataTransfer.files[0]);
+});
+
+function selectFile(file) {
+    selectedFile = file;
+    el.fileName.textContent = file.name;
+    el.fileSize.textContent = formatSize(file.size);
+    el.dropText.style.display = 'none';
+    el.uploadBtn.disabled = false;
+    el.status.textContent = '';
+    el.progressWrap.style.display = 'none';
+}
+
+// ------------------------- 计算文件 MD5 -------------------------
+// 使用 spark-md5 库的增量哈希 API，文件再大也不占内存
+function computeMD5(file) {
+    return new Promise((resolve, reject) => {
+        const spark     = new SparkMD5.ArrayBuffer();
+        const chunkSize = 2 * 1024 * 1024;   // 每次读 2MB
+        let   offset    = 0;
+        const reader    = new FileReader();
+
+        reader.onload = function(e) {
+            spark.append(e.target.result);          // 增量喂入
+            offset += e.target.result.byteLength;
+
+            if (offset >= file.size) {
+                resolve(spark.end());               // 全部读完，输出 hex
+            } else {
+                readNext();                         // 继续读下一块
+            }
+        };
+        reader.onerror = function() { reject(new Error('文件读取失败')); };
+
+        function readNext() {
+            const slice = file.slice(offset, offset + chunkSize);
+            reader.readAsArrayBuffer(slice);
+        }
+        readNext();
+    });
+}
+
+// ------------------------- 核心上传流程 -------------------------
+el.uploadBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+
+    abortFlag = false;
+    el.uploadBtn.disabled = true;
+    el.progressWrap.style.display = 'block';
+    setStatus('正在计算文件 MD5...', '');
+
+    try {
+        // ---------- 第 1 步：计算文件 MD5 ----------
+        const md5 = await computeMD5(selectedFile);
+        setStatus('MD5: ' + md5 + ' | 正在初始化上传...', '');
+
+        // ---------- 第 2 步：POST /upload/init ----------
+        // 告诉服务器："我要上传一个文件，这么大，MD5 是这个"
+        // 服务器返回已接收字节数（新上传为 0，续传为 >0）
+        let initRes = await fetch('/upload/init', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                filename: selectedFile.name,
+                totalSize: selectedFile.size,
+                md5: md5
+            })
+        });
+        let initData = await initRes.json();
+
+        if (initData.status !== 'ok') {
+            throw new Error('初始化失败：' + (initData.msg || '未知错误'));
+        }
+
+        let offset = initData.received;   // 断点续传：从服务器记录的偏移量开始
+        if (offset > 0) {
+            setStatus('检测到已有 ' + formatSize(offset) + ' 数据，续传中...', '');
+        }
+
+        // ---------- 第 3 步：循环 POST /upload/chunk ----------
+        // 把文件切成 CHUNK_SIZE 大小的块，逐块发送
+        while (offset < selectedFile.size) {
+            const chunkEnd = Math.min(offset + CHUNK_SIZE, selectedFile.size);
+            const chunk    = selectedFile.slice(offset, chunkEnd);
+
+            let chunkRes = await fetch('/upload/chunk', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/octet-stream',
+                    'X-Filename': selectedFile.name,
+                    'X-Offset': String(offset),
+                    // Content-Length 由浏览器自动设置（fetch 对 Blob body 会自动加）
+                },
+                body: chunk
+            });
+            let chunkData = await chunkRes.json();
+
+            if (chunkData.status !== 'ok') {
+                throw new Error('上传中断：' + (chunkData.msg || '未知错误') +
+                                ' (已上传 ' + formatSize(offset) + ')');
+            }
+
+            offset = chunkData.received;   // 服务器返回的"总共已接收字节数"
+
+            // 更新进度条
+            const pct = Math.round((offset / selectedFile.size) * 100);
+            el.progressFill.style.width = pct + '%';
+            el.progressText.textContent = formatSize(offset) + ' / ' +
+                                          formatSize(selectedFile.size) + ' (' + pct + '%)';
+        }
+
+        // ---------- 第 4 步：POST /upload/complete ----------
+        // 告诉服务器："发完了，验一下 MD5"
+        setStatus('上传完成，正在校验 MD5...', '');
+        let completeRes = await fetch('/upload/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filename: selectedFile.name })
+        });
+        let completeData = await completeRes.json();
+
+        if (completeData.status === 'ok') {
+            setStatus('✅ 上传成功！MD5 校验通过 ✅', 'ok');
+        } else {
+            throw new Error('MD5 校验失败：' + (completeData.msg || '未知错误'));
+        }
+
+    } catch (err) {
+        setStatus('❌ ' + err.message, 'err');
+        console.error(err);
+    } finally {
+        el.uploadBtn.disabled = false;
+    }
+});
+</script>
+
+</body>
+</html>
